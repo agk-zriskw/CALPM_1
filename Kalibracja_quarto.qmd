@@ -11,11 +11,6 @@ library(openair)
 
 
 ```{r}
-df_raw <- load("dane/ops.Rdata")
-```
-
-You can add options to executable code like this 
-```{r}
 load("dane/ops.RData") 
 ```
 
@@ -30,5 +25,28 @@ ops |> is.na() |> colSums()
 
 ```{r}
 ops |> glimpse()
+```
+
+
+```{r}
+load("dane/ops.RData") ; ops <- ops |> na.omit()
+load("dane/data_test.rdata")
+```
+
+```{r}
+weryfikacja <- ops_data |> select(date:prec)
+weryfikacja <- weryfikacja |> 
+  left_join(bam, by = "date") |> 
+  mutate(grimm_pm10 = bam_pm10) |> 
+  select(-bam_pm10)
+ops <- ops |> select(-ops_pm10, -pres_sea)
+
+nazwy <- colnames(ops) |> dput()
+weryfikacja <- weryfikacja |> 
+  select(all_of(nazwy))
+
+colnames(weryfikacja) == colnames(ops)
+```
+
 ```
 
