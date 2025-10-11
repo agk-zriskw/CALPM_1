@@ -1,0 +1,34 @@
+---
+title: "Kalibracja_Quarto"
+format: html
+---
+
+# Ładowanie danych
+```{r}
+library(tidyverse)
+library(openair)
+```
+
+
+```{r}
+df_raw <- load("dane/ops.Rdata")
+```
+
+You can add options to executable code like this 
+```{r}
+load("dane/ops.RData") 
+```
+
+```{r}
+ops |> summary()
+```
+
+
+```{r}
+ops |> is.na() |> colSums()
+```
+
+```{r}
+ops |> glimpse()
+```
+
