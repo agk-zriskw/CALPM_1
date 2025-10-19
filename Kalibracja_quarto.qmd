@@ -6,6 +6,7 @@ library(tidyverse)
 library(rsample)
 library(recipes)
 library(corrplot)
+library(e1071)
 ```
 
 ## Załadowanie danych
