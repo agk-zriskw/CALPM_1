@@ -42,11 +42,11 @@ rec_base_xgb <- rec_base_xgb |>
   step_normalize(all_numeric_predictors()) |> 
   step_zv(all_predictors())
 
-# 2 - przepis kategotie + interakcje
+# 2 - przepis kategotie + interakcje automatyczne
 
 cv <- names(train) |> keep(~ str_starts(.x, "n_"))
 wv <- names(train) |> keep(~ .x %in% c("ws","mws"))
-  
+
 rec_time_weather_xgb <- recipe(grimm_pm10 ~ ., data = train) |> 
   update_role(date, new_role = "id") |> 
   step_mutate(
@@ -82,33 +82,15 @@ rec_time_weather_xgb <- recipe(grimm_pm10 ~ ., data = train) |>
     hour_c = cos(2*pi*as.numeric(hour)/24),
     wday_s = sin(2*pi*as.numeric(wday)/7),
     wday_c = cos(2*pi*as.numeric(wday)/7)) |> 
-  step_rm(high_rh, high_temp, hour, wday) |>
-  step_string2factor(weather_type, time_of_day) |> 
-  step_zv(all_nominal_predictors()) |> 
-  step_dummy(all_nominal_predictors()) |> 
-  step_mutate(weekend = as.integer(weekend))
-    
+    step_rm(high_rh, high_temp, hour, wday) |> 
+    step_string2factor(weather_type, time_of_day) |> 
+    step_zv(all_nominal_predictors()) |> 
+    step_dummy(all_nominal_predictors()) |> 
+    step_mutate(weekend = as.integer(weekend)) |> 
+    step_YeoJohnson(all_numeric_predictors()) |>
+    step_normalize(all_numeric_predictors()) |>
+    step_zv(all_predictors())  
 # pozniej zeby progi liczyc na train: step_discretize(temp, num_breaks = 4, keep_original_cols = T)
-
-# warunkowe interakcje bo był problem z pustymi miejscami
-has_wt   <- any(startsWith(colnames(train), "weather_type")) || T  
-has_tod  <- any(startsWith(colnames(train), "time_of_day"))  || T
-has_cv_wv <- (length(cv) + length(wv)) > 0
-has_temp  <- "temp" %in% names(train)
-
-if (has_cv_wv || has_temp) {
-  rec_time_weather_xgb <- rec_time_weather_xgb |>
-    step_interact(terms = ~ starts_with("weather_type"):any_of(c(cv, wv, "temp")))}
-
-if (has_cv_wv) {
-  rec_time_weather_xgb <- rec_time_weather_xgb |>
-    step_interact(terms = ~ starts_with("time_of_day"):any_of(c(cv, wv))) |>
-    step_interact(terms = ~ weekend:any_of(c(cv, wv)))}
-
-rec_time_weather_xgb <- rec_time_weather_xgb |>
-  step_YeoJohnson(all_numeric_predictors()) |>
-  step_normalize(all_numeric_predictors()) |>
-  step_zv(all_predictors())
 
 # 3 - przepis z PCA (model ma mniej zmiennych do analizy,
 #     zachowuje najwazniejsze "n_"
