@@ -1,11 +1,15 @@
 # Model XGB ---------------------------------------------------------------
 
-# Przepisy 
+# Przepisy ----------------------------------------------------------------
 
 library(tidyverse)
 library(tidymodels)
 library(lubridate)
 library(knitr)
+library(xgboost)
+library(vip)
+library(workflowsets)
+library(purrr)
 tidymodels_prefer()
 set.seed(123)
 
@@ -42,11 +46,11 @@ rec_base_xgb <- rec_base_xgb |>
   step_normalize(all_numeric_predictors()) |> 
   step_zv(all_predictors())
 
-# 2 - przepis kategotie + interakcje
+# 2 - przepis kategotie + interakcje automatyczne
 
 cv <- names(train) |> keep(~ str_starts(.x, "n_"))
 wv <- names(train) |> keep(~ .x %in% c("ws","mws"))
-  
+
 rec_time_weather_xgb <- recipe(grimm_pm10 ~ ., data = train) |> 
   update_role(date, new_role = "id") |> 
   step_mutate(
@@ -82,33 +86,15 @@ rec_time_weather_xgb <- recipe(grimm_pm10 ~ ., data = train) |>
     hour_c = cos(2*pi*as.numeric(hour)/24),
     wday_s = sin(2*pi*as.numeric(wday)/7),
     wday_c = cos(2*pi*as.numeric(wday)/7)) |> 
-  step_rm(high_rh, high_temp, hour, wday) |>
-  step_string2factor(weather_type, time_of_day) |> 
-  step_zv(all_nominal_predictors()) |> 
-  step_dummy(all_nominal_predictors()) |> 
-  step_mutate(weekend = as.integer(weekend))
-    
+    step_rm(high_rh, high_temp, hour, wday) |> 
+    step_string2factor(weather_type, time_of_day) |> 
+    step_zv(all_nominal_predictors()) |> 
+    step_dummy(all_nominal_predictors()) |> 
+    step_mutate(weekend = as.integer(weekend)) |> 
+    step_YeoJohnson(all_numeric_predictors()) |>
+    step_normalize(all_numeric_predictors()) |>
+    step_zv(all_predictors())  
 # pozniej zeby progi liczyc na train: step_discretize(temp, num_breaks = 4, keep_original_cols = T)
-
-# warunkowe interakcje bo był problem z pustymi miejscami
-has_wt   <- any(startsWith(colnames(train), "weather_type")) || T  
-has_tod  <- any(startsWith(colnames(train), "time_of_day"))  || T
-has_cv_wv <- (length(cv) + length(wv)) > 0
-has_temp  <- "temp" %in% names(train)
-
-if (has_cv_wv || has_temp) {
-  rec_time_weather_xgb <- rec_time_weather_xgb |>
-    step_interact(terms = ~ starts_with("weather_type"):any_of(c(cv, wv, "temp")))}
-
-if (has_cv_wv) {
-  rec_time_weather_xgb <- rec_time_weather_xgb |>
-    step_interact(terms = ~ starts_with("time_of_day"):any_of(c(cv, wv))) |>
-    step_interact(terms = ~ weekend:any_of(c(cv, wv)))}
-
-rec_time_weather_xgb <- rec_time_weather_xgb |>
-  step_YeoJohnson(all_numeric_predictors()) |>
-  step_normalize(all_numeric_predictors()) |>
-  step_zv(all_predictors())
 
 # 3 - przepis z PCA (model ma mniej zmiennych do analizy,
 #     zachowuje najwazniejsze "n_"
@@ -148,5 +134,165 @@ train_pca <- juice(rec_pca_prep)
 test_pca  <- bake(rec_pca_prep, new_data = test)
 cat("Wymiary train:", dim(train_pca)[1], "x", dim(train_pca)[2], "\n")
 glimpse(train_pca)
+
+
+# Definicja modelu --------------------------------------------------------
+
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  mtry = tune(),
+  loss_reduction = tune()) |> 
+  set_engine("xgboost") |> 
+  set_mode("regression")
+
+
+# Walidacja krzyżowa ------------------------------------------------------
+
+set.seed(42)
+cv_folds <- vfold_cv(train, v = 5)
+
+
+# Workflow ----------------------------------------------------------------
+
+recipe_list <- list(
+  base = rec_base_xgb,
+  features = rec_time_weather_xgb,
+  pca = rec_pca_xgb)
+
+wf_set <- workflow_set(
+  preproc = recipe_list,
+  models = list(xgb = xgb_spec),
+  cross = T)
+
+print(wf_set)
+
+# Tuning ------------------------------------------------------------------
+
+# ile predyktorów zostaje dla każdego recipe
+count_predictors_after_prep <- function(rec, training_data) {
+  rp <- tryCatch(prep(rec, training = training_data), error = function(e) e)
+  if (inherits(rp, "error")) {
+    warning("Prep failed for a recipe: ", conditionMessage(rp))
+    return(0)
+  }
+  max(0, ncol(juice(rp)) - 1)  # -1 bo kolumna celu
+}
+
+pred_counts <- map_int(recipe_list, ~ count_predictors_after_prep(.x, training = train))
+print(pred_counts)  
+
+min_preds <- min(pred_counts[pred_counts > 0], na.rm = TRUE)
+if (is.na(min_preds) || min_preds <= 0) {
+  stop("Nie udało się policzyć liczby predyktorów dla żadnego recipe.")
+}
+
+# bezpieczny zakres mtry
+mtry_upper <- min(5, as.integer(min_preds))
+mtry_lower <- 1
+
+message("Ustawiam mtry range: ", mtry_lower, " - ", mtry_upper)
+
+set.seed(123)
+xgb_grid <- grid_latin_hypercube(
+  trees(range = c(250, 1500)),
+  tree_depth(range = c(3, 10)),
+  min_n(range = c(10, 50)),
+  learn_rate(range = c(-2.5, -1)),  
+  mtry(range = c(mtry_lower, mtry_upper)),
+  loss_reduction(range = c(0,10)),
+  size = 50
+)
+
+set.seed(123)
+tune_results <- wf_set |> 
+  workflow_map(
+    "tune_grid",
+    resamples = cv_folds,
+    grid = xgb_grid,
+    metrics = metric_set(rmse, mae),
+    control = control_grid(save_pred = TRUE, verbose = TRUE)
+  )
+
+# Ewaluacja ---------------------------------------------------------------
+
+print(autoplot(tune_results))
+ranking <- rank_results(tune_results, rank_metric = "rmse", select_best = T)
+print(ranking)
+
+best_combo <- tune_results |>  #combo = przepis i parametry
+  rank_results(rank_metric = "rmse") |> 
+  filter(.metric == "rmse") |> 
+  slice_head(n = 1)
+
+cat("\n Najlepsza kombinacja \n")
+print(best_combo)
+
+best_wf_id <- best_combo$wflow_id[1]
+
+best_wf <- tune_results |> 
+  extract_workflow(best_wf_id)
+
+best_params <- tune_results |> 
+  extract_workflow_set_result(best_wf_id) |> 
+  select_best(metric = "rmse")
+
+cat("\n Najlepsze parametry \n")
+print(best_params)
+
+# Finalizacja -------------------------------------------------------------
+
+final_xgb_wf <- finalize_workflow(best_wf, best_params)
+
+cat("\n Finalny workflow \n")
+print(final_xgb_wf)
+
+final_fit <- last_fit(final_xgb_wf, split = split)
+
+cat("\n Metryki na zbiorze testowym \n")
+print(collect_metrics(final_fit))
+
+test_pred <- collect_predictions(final_fit)
+
+pred_plot <- ggplot(test_pred, aes(x = .pred, y= grimm_pm10)) +
+  geom_point(alpha = 0.5, color = "pink2") +
+  geom_abline(color = "purple", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Wartości obserwowane a predykcja na zbiorze testowym",
+    x = "Predykcje",
+    y = "Wartości obserwowane") +
+  theme_minimal() +
+  coord_fixed()
+
+print(pred_plot)
+
+wf_fitted <- final_fit$.workflow[[1]]
+
+fit_parsnip <- tryCatch(
+  extract_fit_parsnip(wf_fitted),
+  error = function(e) {
+    message("extract_fit_parsnip nie zadziałał, stosuję pull_workflow_fit()")
+    pull_workflow_fit(wf_fitted)})
+
+xgb_fit_engine <- fit_parsnip$fit
+
+vip_plot <- vip(xgb_fit_engine, num_features = 20) +
+  ggtitle("Najważniejsze zmienne w modelu XGB")
+
+print(vip_plot)
+
+# Wyniki ------------------------------------------------------------------
+
+if (!dir.exists("wyniki_xgb")) {
+  dir.create("wyniki_xgb", recursive = TRUE)}
+
+metryki_testowe <- collect_metrics(final_fit)
+write_csv(metryki_testowe, "wyniki_xgb/metryki_testowe.csv")
+write_csv(best_params, "wyniki_xgb/najlepsze_hiperparametry.csv")
+
+final_workflow_fitted <- extract_workflow(final_fit)
+saveRDS(final_workflow_fitted, "wyniki_xgb/final_xgb_workflow.rds")
 
 
