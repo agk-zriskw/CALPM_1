@@ -47,8 +47,12 @@ ts_cv <- rolling_origin(
   skip = skip
 )
 
-
 length(ts_cv$splits)
+
+rec <- recipe(grimm_pm10 ~ ., data = train_tr) %>%
+  step_zv(all_predictors()) %>%             
+  step_dummy(all_nominal_predictors()) %>%  
+  step_normalize(all_numeric_predictors())  
 
 
 lm_spec <- linear_reg() %>%
@@ -57,7 +61,7 @@ lm_spec <- linear_reg() %>%
 
 lm_wf <- workflow() %>%
   add_model(lm_spec) %>%
-  add_formula(as.formula(paste(target, "~ .")))
+  add_recipe(rec)
 
 
 lm_resamples <- fit_resamples(
@@ -68,16 +72,13 @@ lm_resamples <- fit_resamples(
 )
 
 collect_metrics(lm_resamples)
-
-
 lm_preds <- collect_predictions(lm_resamples)
 
 
-lm_final <- lm_wf %>% fit(data = train_tr)
-
+lm_final <- lm_wf %>%
+  fit(data = train_tr)
 
 tidy(lm_final %>% extract_fit_parsnip())
-
 
 lm_obj <- lm_final %>% pull_workflow_fit() %>% .$fit
 vif_safe <- function(model) { #vif(lm_obj) wcześniej był problem z tą funkcją
@@ -138,3 +139,13 @@ lm_coefs <- tidy(lm_obj) %>% arrange(p.value)
 print("Główne współczynniki (LM):")
 print(head(lm_coefs, 20))
 
+
+if (!dir.exists("wyniki_lr")) {
+  dir.create("wyniki_lr", recursive = TRUE)
+}
+
+#zapis wyników 
+saveRDS(lm_resamples, "wyniki/lm_resamples.rds")          
+saveRDS(lm_final, "wyniki/lm_final_model.rds")            
+saveRDS(metrics_test_lm, "wyniki/lm_test_metrics.rds")    
+saveRDS(lm_coefs, "wyniki/lm_coefficients.rds")           
