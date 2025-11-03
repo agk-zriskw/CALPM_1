@@ -84,6 +84,8 @@ if (file.exists(lr_model_path)) {
   message("Wczytuję model LR...")
   lr_final_model <- readRDS(lr_model_path)
   
+  test_tr
+  
   # WAŻNE: Model LR był trenowany na `train_tr`, więc predykcje robimy na `test_tr`
   lr_preds <- predict(lr_final_model, new_data = test_tr) |>
     bind_cols(test_tr |> select(grimm_pm10, date)) |> # `date` jest w `test_tr` jako "id"
@@ -147,5 +149,74 @@ if (nrow(wszystkie_predykcje) > 0) {
   message("Brak danych predykcyjnych do wygenerowania wykresu.")
 }
 
+najlepszy_model <- metryki_tabela |>
+  slice_min(rmse, n = 1) |>
+  pull(model)
+
+cat("\nNajlepszy model na zbiorze testowym (na podstawie metryki RMSE) to:", najlepszy_model, "\n")
+
+load("dane/ops.RData") 
+
+final_model <- xgb_final_wf
+uzyty_model <- "XGBoost"
 
 
+
+
+# 1. Zostawiam tylko dane meteo z ops_data
+weryfikacja <- ops_data |> 
+  select(date:prec) |> 
+  left_join(bam, by = "date") |> 
+  mutate(grimm_pm10 = bam_pm10) |> 
+  select(-bam_pm10)
+
+# 2. Przygotowanie zestawu predykcyjnego w tej samej strukturze co `ops`
+ops <- ops |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) |>
+  select(-ops_pm10, -pres_sea)
+
+# 3. Ujednolicenie struktury
+nazwy <- colnames(ops)
+weryfikacja <- weryfikacja |> 
+  select(all_of(nazwy))
+
+colnames(weryfikacja) == colnames(ops_data)
+
+# 4. Uzupełnienie ewentualnych brakujących kolumn (np. hour, wday)
+if(!"hour" %in% names(weryfikacja)){
+  weryfikacja <- weryfikacja |> mutate(hour = lubridate::hour(date))
+}
+if(!"wday" %in% names(weryfikacja)){
+  weryfikacja <- weryfikacja |> mutate(wday = lubridate::wday(date))
+}
+
+# 5. Wypełnienie NA medianami (jak w treningu)
+weryfikacja <- weryfikacja |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+# 6. Predykcja -------------------------------------------------------------
+weryfikacja_preds <- predict(final_model, new_data = weryfikacja) |> 
+  bind_cols(weryfikacja |> select(date, grimm_pm10))
+
+metrics_set <- yardstick::metric_set(rmse, rsq, mae)
+
+metryki_weryfikacja <- metrics_set(
+  data = weryfikacja_preds,
+  truth = grimm_pm10,
+  estimate = .pred
+)
+
+print(metryki_weryfikacja)
+
+library(ggplot2)
+
+ggplot(weryfikacja_preds, aes(x = .pred, y = grimm_pm10)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(linetype = "dashed", color = "red") +
+  coord_fixed() +
+  labs(
+    title = "Porównanie predykcji XGB na zbiorze weryfikacyjnym",
+    x = "Predykcja modelu",
+    y = "Obserwacja (grimm_pm10)"
+  ) +
+  theme_minimal()
