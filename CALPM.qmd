@@ -37,6 +37,7 @@ editor_options:
 ---
 
 # Czyszczenie i eksporacja danych
+
 ## Setup
 
 ```{r}
@@ -74,6 +75,7 @@ set.seed(123)
 ```{r}
 load("dane/ops.RData") 
 ops <- ops |> na.omit()
+ops <- ops |> select(-ops_pm10, -pres_sea)
 ```
 
 ## Podstawowe sprawdzenie danych
@@ -150,7 +152,7 @@ print(skew_tbl)
 
 ## Analiza korelacji
 
-Z par zmiennych objaśniających o wspólczynniku korelacji powyżej 0.9 zostanie usunięta zmienna, która mniej koreluje ze zmienną objąsnianą. 
+Z par zmiennych objaśniających o wspólczynniku korelacji powyżej 0.9 zostanie usunięta zmienna, która mniej koreluje ze zmienną objąsnianą.
 
 ```{r}
 zliczenia <- train %>% select(starts_with("n_")) %>% names()
@@ -334,13 +336,13 @@ ggplot(train_time, aes(n_0500, grimm_pm10, color = hour_cat)) +
 
 W ostatecznym przepisie uwzględniono:
 
-- Transformacje trygonometryczne czasu,
+-   Transformacje trygonometryczne czasu,
 
-- Interakcje między zmiennymi pogodowymi i cząsteczkami,
+-   Interakcje między zmiennymi pogodowymi i cząsteczkami,
 
-- Normalizację i transformację Yeo–Johnsona,
+-   Normalizację i transformację Yeo–Johnsona,
 
-- Kodowanie zmiennych kategorycznych.
+-   Kodowanie zmiennych kategorycznych.
 
 ### Wyjściowy przepis
 
@@ -517,7 +519,7 @@ rec_time_weather_xgb <- recipe(grimm_pm10 ~ ., data = train) |>
 # pozniej zeby progi liczyc na train: step_discretize(temp, num_breaks = 4, keep_original_cols = T)
 ```
 
-## Przepis z PCA (model ma mniej zmiennych do analizy, zachowuje najwazniejsze "n_"
+## Przepis z PCA (model ma mniej zmiennych do analizy, zachowuje najwazniejsze "n\_"
 
 ```{r}
 rec_pca_xgb <-  recipe(grimm_pm10 ~ ., data = train) |> 
@@ -534,7 +536,7 @@ rec_pca_xgb <-  recipe(grimm_pm10 ~ ., data = train) |>
   step_zv(all_predictors())
 ```
 
-## Test 
+## Test
 
 Testowe przygotowanie danych dla każdego przepisu XGB i podgląd ich struktury.
 
@@ -890,7 +892,7 @@ svr_workflows <- list(
 cv_folds <- vfold_cv(train, v = 5, strata = grimm_pm10)
 ```
 
-## Siatka hiperparametrów 
+## Siatka hiperparametrów
 
 Definicja siatki hiperparametrów i metryk dla SVR.
 
@@ -1113,7 +1115,7 @@ shapiro_test <- shapiro.test(train_tr_lm$.resid[1:min(5000, nrow(train_tr_lm))])
 print(shapiro_test)
 ```
 
-## Predykcje i metryki  na zbiorze testowym
+## Predykcje i metryki na zbiorze testowym
 
 ```{r}
 test_pred_lm <- predict(lm_obj, newdata = test_tr_ml) %>% 
@@ -1340,7 +1342,7 @@ weryfikacja <- weryfikacja |>
   mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
 ```
 
-## Predykcja 
+## Predykcja
 
 ```{r}
 weryfikacja_preds <- predict(final_model, new_data = weryfikacja) |> 
@@ -1370,6 +1372,71 @@ ggplot(weryfikacja_preds, aes(x = .pred, y = grimm_pm10)) +
   theme_minimal()
 ```
 
+# Wnioski
 
+# Wnioski z analizy modeli
 
+Celem analizy było znalezienie najlepszego modelu regresyjnego do przewidywania stężenia **`grimm_pm10`**.\
+Porównano trzy algorytmy: **Regresję Liniową (LR)**, **Support Vector Regression (SVR)** oraz **XGBoost (XGB)**.
 
+------------------------------------------------------------------------
+
+## 1. Najlepsze przepisy (receptury)
+
+### XGBoost (XGB)
+
+-   Najlepsze wyniki osiągnął przy użyciu złożonego przepisu **`features_xgb`**,\
+    który obejmował zaawansowaną inżynierię cech, m.in.:
+    -   kategoryzację pogody i pory dnia,\
+    -   tworzenie interakcji między zmiennymi.
+
+### 🟦 Support Vector Regression (SVR)
+
+-   Najskuteczniejszy okazał się prostszy, bazowy przepis **`svr_base`**,\
+    który zawierał m.in.:
+    -   transformacje trygonometryczne czasu,\
+    -   normalizację danych.
+
+### 🟨 Regresja Liniowa (LR)
+
+-   Model ten korzystał z podstawowego przepisu, który obejmował m.in.:
+    -   usunięcie zmiennych skorelowanych,\
+    -   transformację **Yeo-Johnsona**.
+
+------------------------------------------------------------------------
+
+## 2. Wybór najlepszego modelu
+
+Porównanie metryk na zbiorze testowym:
+
+| Model             | RMSE  | R-squared (R²) | MAE   |
+|-------------------|-------|----------------|-------|
+| SVR               | 8.98  | 0.921          | 6.72  |
+| XGBoost           | 11.09 | 0.861          | 5.57  |
+| Linear Regression | 15.61 | 0.743          | 11.61 |
+
+**Wnioski:** 1. Regresja Liniowa była najsłabszym modelem.\
+2. SVR uzyskał najlepsze wyniki pod kątem RMSE i R-squared.\
+3. XGBoost osiągnął najlepszą (najniższą) metrykę MAE (Mean Absolute Error).
+
+**Ostatecznie wybrano model XGBoost** do dalszej weryfikacji — dlatego, że metryka **MAE** jest mniej wrażliwa na wartości odstające, co jest pożądane w danych o zanieczyszczeniach.
+
+------------------------------------------------------------------------
+
+## 3. Weryfikacja na zbiorze "BAM"
+
+**Cel:**\
+Sprawdzenie, jak wybrany model **XGBoost** poradzi sobie z zupełnie nowymi, zewnętrznymi danymi (ze stacji BAM), których nie widział podczas treningu.
+
+**Wyniki:**\
+Model na zbiorze weryfikacyjnym uzyskał jeszcze lepsze metryki niż na zbiorze testowym:
+
+| Metryka | Wartość |
+|---------|---------|
+| RMSE    | 6.65    |
+| R²      | 0.846   |
+| MAE     | 4.53    |
+
+**Wniosek:**\
+Znacznie lepsze wyniki (np. MAE 4.53 vs 5.57) dowodzą, że model **XGBoost** jest solidny, dokładny i bardzo dobrze generalizuje swoją wiedzę na nowe dane z innego źródła.\
+Potwierdza to również wykres predykcji, pokazujący silną korelację prognoz z obserwacjami.
