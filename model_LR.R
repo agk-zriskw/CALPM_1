@@ -28,12 +28,6 @@ if (!exists("train") || !exists("test")) {
 target <- "grimm_pm10"
 
 
-if("date" %in% names(train_tr)) {
-  train_tr <- train_tr %>% select(-date)
-  test_tr  <- test_tr  %>% select(-date)
-}
-
-
 n <- nrow(train_tr)
 initial <- floor(0.6 * n)       
 assess  <- floor(0.2 * n)       
