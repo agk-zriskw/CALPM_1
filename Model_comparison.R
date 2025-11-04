@@ -156,31 +156,32 @@ najlepszy_model <- metryki_tabela |>
 cat("\nNajlepszy model na zbiorze testowym (na podstawie metryki RMSE) to:", najlepszy_model, "\n")
 
 load("dane/ops.RData") 
+load("dane/data_test.RData")
 
 final_model <- xgb_final_wf
 uzyty_model <- "XGBoost"
 
 
+weryfikacja <- ops_data |> select(date:prec) 
+# wyciągasz z ops_data tylko daty i dane meteo
 
-
-# 1. Zostawiam tylko dane meteo z ops_data
-weryfikacja <- ops_data |> 
-  select(date:prec) |> 
+weryfikacja <- weryfikacja |> 
   left_join(bam, by = "date") |> 
   mutate(grimm_pm10 = bam_pm10) |> 
   select(-bam_pm10)
+# dodajesz dane BAM i podmieniasz nazwę kolumny bam_pm10 na grimm_pm10
+# (żeby struktura była taka sama jak w danych treningowych)
 
-# 2. Przygotowanie zestawu predykcyjnego w tej samej strukturze co `ops`
-ops <- ops |> 
-  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) |>
-  select(-ops_pm10, -pres_sea)
+ops <- ops |> select(-ops_pm10, -pres_sea)
+# usuwasz kolumny niepotrzebne przy predykcji
 
-# 3. Ujednolicenie struktury
-nazwy <- colnames(ops)
+nazwy <- colnames(ops) |> dput()
 weryfikacja <- weryfikacja |> 
   select(all_of(nazwy))
 
-colnames(weryfikacja) == colnames(ops_data)
+colnames(weryfikacja) == colnames(ops)
+weryfikacja <-weryfikacja |> na.omit()
+
 
 # 4. Uzupełnienie ewentualnych brakujących kolumn (np. hour, wday)
 if(!"hour" %in% names(weryfikacja)){

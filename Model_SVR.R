@@ -52,7 +52,7 @@ rec_svr_base <- recipe(grimm_pm10 ~ ., data = train) |>
   step_zv(all_predictors())
 
 
-# RECEPTA 2: INTERAKCJE POGODOWE
+# RECEPTA 2: INTERAKCJE POGODOWE — FIX
 rec_svr_weather <- recipe(grimm_pm10 ~ ., data = train) |>
   update_role(date, new_role = "id") |>
   step_mutate(
@@ -60,28 +60,27 @@ rec_svr_weather <- recipe(grimm_pm10 ~ ., data = train) |>
     hour_c = cos(2*pi*as.numeric(hour)/24),
     wday_s = sin(2*pi*as.numeric(wday)/7),
     wday_c = cos(2*pi*as.numeric(wday)/7),
-    # Typ pogody
-    high_rh = if("rh" %in% names(train)) rh > median(rh, na.rm = TRUE) else NA,
-    high_temp = if("temp" %in% names(train)) temp > median(temp, na.rm = TRUE) else NA,
+    high_rh   = if ("rh"   %in% names(train)) rh   > median(rh,   na.rm = TRUE) else NA,
+    high_temp = if ("temp" %in% names(train)) temp > median(temp, na.rm = TRUE) else NA,
     weather_type = case_when(
       isTRUE(high_rh) & isTRUE(high_temp) ~ "warm_humid",
       isTRUE(high_rh) & !isTRUE(high_temp) ~ "cold_humid",
       !isTRUE(high_rh) & isTRUE(high_temp) ~ "warm_dry",
       TRUE ~ "cold_dry"
-    )
+    ),
+    # >>> WYMUSZAMY STAŁE POZIOMY <<<
+    weather_type = factor(weather_type,
+                          levels = c("warm_humid","cold_humid","warm_dry","cold_dry"))
   ) |>
   step_rm(hour, wday, high_rh, high_temp) |>
   step_rm(any_of(final_to_drop)) |>
-  step_string2factor(weather_type) |>
-  step_novel(all_nominal_predictors()) |>
   step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
-  step_zv(all_predictors()) |>  
-  # Interakcje pogoda x zliczenia cząsteczek
+  # >>> INTERAKCJE ZANIM COKOLWIEK USUNIEMY <<<
   step_interact(terms = ~ starts_with("weather_type_"):matches("^n_\\d+$")) |>
-  # Interakcje pogoda x wiatr
   step_interact(terms = ~ starts_with("weather_type_"):matches("^(ws|mws)$")) |>
   step_YeoJohnson(all_numeric_predictors()) |>
   step_normalize(all_numeric_predictors()) |>
+  # >>> DOPIERO TERAZ PRUNING <<<
   step_zv(all_predictors())
 
 
@@ -126,30 +125,24 @@ rec_svr_combined <- recipe(grimm_pm10 ~ ., data = train) |>
     hour_c = cos(2*pi*as.numeric(hour)/24),
     wday_s = sin(2*pi*as.numeric(wday)/7),
     wday_c = cos(2*pi*as.numeric(wday)/7),
-    # Kwartyle temperatury
-    temp_bin = if("temp" %in% names(train)) cut(
+    temp_bin = if ("temp" %in% names(train)) cut(
       temp,
       breaks = quantile(temp, probs = seq(0, 1, 0.25), na.rm = TRUE),
       include.lowest = TRUE,
-      labels = c("q1", "q2", "q3", "q4")
+      labels = c("q1","q2","q3","q4")
     ) else NA_character_,
-    # Typ pogody uproszczony
-    high_rh = if("rh" %in% names(train)) rh > median(rh, na.rm = TRUE) else NA,
+    high_rh = if ("rh" %in% names(train)) rh > median(rh, na.rm = TRUE) else NA,
     weather_humid = if_else(isTRUE(high_rh), "humid", "dry"),
-    # Weekend
-    weekend = as.integer(as.numeric(wday) %in% c(6, 7))
+    weekend = as.integer(as.numeric(wday) %in% c(6, 7)),
+    # stałe poziomy
+    temp_bin = factor(temp_bin, levels = c("q1","q2","q3","q4")),
+    weather_humid = factor(weather_humid, levels = c("humid","dry"))
   ) |>
   step_rm(hour, wday, high_rh) |>
   step_rm(any_of(final_to_drop)) |>
-  step_string2factor(temp_bin, weather_humid) |>
-  step_novel(all_nominal_predictors()) |>
   step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
-  step_zv(all_predictors()) |>  # DODANE
-  # Interakcje temperatura x główne zliczenia
   step_interact(terms = ~ starts_with("temp_bin_"):matches("^n_(0250|0500|1000)$")) |>
-  # Interakcje wilgotność x wiatr
   step_interact(terms = ~ starts_with("weather_humid_"):matches("^(ws|mws)$")) |>
-  # Interakcje weekend x top zliczenia
   step_interact(terms = ~ weekend:matches("^n_(0250|0500|1000)$")) |>
   step_YeoJohnson(all_numeric_predictors()) |>
   step_normalize(all_numeric_predictors()) |>

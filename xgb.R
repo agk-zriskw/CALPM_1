@@ -22,6 +22,37 @@ if (!exists("train") || !exists("test")) {
   message("Dane są już wczytane")
 }
 
+library(dplyr)
+library(lubridate)
+
+fix_inputs <- function(df) {
+  df %>%
+    mutate(
+      date = as.POSIXct(date, tz = "UTC"),
+      hour = if ("hour" %in% names(.)) {
+        suppressWarnings(as.numeric(as.character(hour)))
+      } else {
+        as.numeric(lubridate::hour(date))
+      },
+      wday = if ("wday" %in% names(.)) {
+        suppressWarnings(as.numeric(as.character(wday)))
+      } else {
+        as.numeric(lubridate::wday(date, week_start = 1))
+      },
+      grimm_pm10 = as.numeric(grimm_pm10)
+    ) %>%
+    mutate(
+      hour = pmin(pmax(hour, 0), 23),
+      wday = pmin(pmax(wday, 1), 7)
+    )
+}
+
+
+train <- fix_inputs(train)
+test  <- fix_inputs(test)
+
+split <- initial_time_split(train, prop = 0.8)
+
 #print(head(train))
 #print(head(test))
 
@@ -256,15 +287,17 @@ print(collect_metrics(final_fit))
 
 test_pred <- collect_predictions(final_fit)
 
-pred_plot <- ggplot(test_pred, aes(x = .pred, y= grimm_pm10)) +
+pred_plot <- ggplot(test_pred, aes(x = .pred, y = grimm_pm10)) +
   geom_point(alpha = 0.5, color = "pink2") +
   geom_abline(color = "purple", linetype = "dashed", linewidth = 1) +
   labs(
     title = "Wartości obserwowane a predykcja na zbiorze testowym",
     x = "Predykcje",
-    y = "Wartości obserwowane") +
+    y = "Wartości obserwowane"
+  ) +
   theme_minimal() +
   coord_fixed()
+
 
 print(pred_plot)
 

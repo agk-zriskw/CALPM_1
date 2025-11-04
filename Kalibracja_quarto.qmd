@@ -12,24 +12,32 @@ library(e1071)
 ## Załadowanie danych
 
 ```{r}
-load("dane/data_test.rdata")
+load("dane/ops.RData") 
+ ops <- ops |> na.omit()
 ```
 
 ## Podstawowe sprawdzenie danych
 
 ```{r}
 print("Brakujące wartości:")
-print(colSums(is.na(ops_data)))
+print(colSums(is.na(ops)))
 print("Podsumowanie:")
-print(summary(ops_data))
-glimpse(ops_data)
+print(summary(ops))
+glimpse(ops)
 ```
 Zmienna poj_h zostanie usunięta ze względu na zerową wariancję.
 ## Podzielenie zbioru
 
 ```{r}
 set.seed(42)
-split <- initial_time_split(ops_data %>% select(-poj_h), prop = 0.7)
+
+
+ops <-  ops |> 
+  mutate(
+    hour = lubridate::hour(date),
+    wday = lubridate::wday(date, label = FALSE, week_start = 1)  # Monday = 1
+  )
+split <- initial_time_split(ops, prop = 0.7)
 train <- training(split)
 test <- testing(split)
 ```
@@ -66,10 +74,6 @@ outlier_summary <- train %>%
 
 print("Wartości odstające")
 print(outlier_summary %>% filter(pct_outliers > 0))
-
-vars_to_winsorize <- outlier_summary %>%
-  pull(variable)
-
 
 ```
 
@@ -133,20 +137,6 @@ print(pairs_df)
 ## Budowa przepisu
 
 ```{r}
-
-# Granice winsoryzacji
-winsor_limits <- train %>%
-  summarise(across(all_of(vars_to_winsorize), 
-                   ~list(quantile(.x, c(0.01, 0.99), na.rm = TRUE)))) %>%
-  pivot_longer(everything(), names_to = "variable", values_to = "limits")
-
-# Winsoryzacja
-for (var in vars_to_winsorize) {
-  limits <- quantile(train[[var]], c(0.01, 0.99), na.rm = TRUE)
-  train[[var]] <- pmin(pmax(train[[var]], limits[1]), limits[2])
-  test[[var]] <- pmin(pmax(test[[var]], limits[1]), limits[2])
-}
-  
 
 rec <- recipe(grimm_pm10 ~ ., data = train) %>%
   update_role(date, new_role = "id") %>%
