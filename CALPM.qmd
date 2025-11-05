@@ -1,0 +1,1442 @@
+---
+title: "CALPM"
+author: "Grupa 1"
+format: 
+  html:
+    self-contained: true
+    toc: true
+    toc-depth: 4
+    toc-location: right
+    toc-title: "Spis treści"
+    number-sections: true
+    number-depth: 4
+    number-offset: 0
+    code-fold: show
+    code-summary: "Show and hide code"
+    code-tools: true
+    code-block-bg: true
+    code-block-border-left: "black"
+    code-line-numbers: false
+    code-copy: true
+    html-math-method: katex
+    smooth-scroll: true
+    anchor-sections: true
+    link-external-icon: true
+    link-external-newwindow: true
+    theme:
+        light: cosmo
+        dark: darkly
+    fontsize: 1.0em
+    linestretch: 1.5
+execute:
+  warning: false
+  echo: true
+  error: false
+editor_options: 
+  chunk_output_type: console
+---
+
+# Czyszczenie i eksporacja danych
+
+## Setup
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(corrplot)
+library(patchwork)
+library(vip)
+library(knitr)
+library(tidymodels)
+library(rsample)
+library(recipes)
+library(parsnip)
+library(workflows)
+library(workflowsets)
+library(broom)
+library(xgboost)
+library(kernlab)
+library(glmnet)
+library(car)
+library(tictoc)
+library(e1071)
+
+tidymodels_prefer()
+set.seed(123)
+```
+
+## Załadowanie danych
+
+```{r}
+load("dane/ops.RData") 
+ops <- ops |> na.omit()
+ops <- ops |> select(-ops_pm10, -pres_sea)
+```
+
+## Podstawowe sprawdzenie danych
+
+```{r}
+colSums(is.na(ops))
+summary(ops)
+glimpse(ops)
+```
+
+Zmienna poj_h zostanie usunięta ze względu na zerową wariancję.
+
+## Podzielenie zbioru
+
+```{r}
+ops <-  ops |> 
+  mutate(
+    hour = lubridate::hour(date),
+    wday = lubridate::wday(date, label = FALSE, week_start = 1)  # Monday = 1
+  )
+split <- initial_time_split(ops, prop = 0.7)
+train <- training(split)
+test <- testing(split)
+```
+
+Dane dzielone są na zbiór uczący (70%) i testowy (30%). Dodatkowo tworzona jest informacja o godzinie i dniu tygodnia.
+
+## Obsługa wartości odstających
+
+```{r}
+# Identyfikacja wartości odstających za pomocą rozkładu międzykwartylowego
+detect_outliers <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower <- q1 - 3 * iqr  
+  upper <- q3 + 3 * iqr # Konserwatywne przyjęcie
+  
+  n_lower <- sum(x < lower, na.rm = TRUE)
+  n_upper <- sum(x > upper, na.rm = TRUE)
+  pct_outliers <- (n_lower + n_upper) / length(x) * 100
+  
+  tibble(lower = lower, upper = upper, 
+         n_lower = n_lower, n_upper = n_upper,
+         pct_outliers = round(pct_outliers, 2))
+}
+
+numeric_cols <- train %>% select(where(is.numeric), -wd) %>% names()
+
+outlier_summary <- train %>%
+  summarise(across(all_of(numeric_cols), detect_outliers)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "stats") %>%
+  unnest(stats) %>%
+  arrange(desc(pct_outliers))
+
+print("Wartości odstające")
+print(outlier_summary %>% filter(pct_outliers > 0))
+```
+
+## Analiza skośności
+
+Ze względu na bardzo wysoką skośność prawostronną konieczne jest zastosowanie transformacji Yeo-Johnsona
+
+```{r}
+numeric_cols <- train %>% select(where(is.numeric), -wd) %>% names()
+
+skew_tbl <- train %>%
+  summarise(across(all_of(numeric_cols), ~skewness(.x, na.rm = TRUE, type = 2))) %>%
+  pivot_longer(everything(), names_to = "Zmienne", values_to = "Skosnosc") %>%
+  arrange(desc(abs(Skosnosc)))
+
+print(skew_tbl)
+```
+
+## Analiza korelacji
+
+Z par zmiennych objaśniających o wspólczynniku korelacji powyżej 0.9 zostanie usunięta zmienna, która mniej koreluje ze zmienną objąsnianą.
+
+```{r}
+zliczenia <- train %>% select(starts_with("n_")) %>% names()
+target <- "grimm_pm10"
+thr <- 0.9
+
+# Zliczenia oraz zmienne dotyczące wiatru
+preds <- c(zliczenia, "ws", "mws") %>% .[. %in% names(train)]
+
+# Korelacja
+cor_mat <- cor(train[, preds], use = "pairwise.complete.obs", method = "spearman")
+tgt_cor <- abs(cor(train[, preds], train[[target]], use = "pairwise.complete.obs", method = "spearman"))
+
+# Identyfikacja silnie skorelowanych zmiennych
+pairs_df <- as.data.frame(as.table(cor_mat)) %>%
+  as_tibble() %>%
+  transmute(var1 = as.character(Var1), var2 = as.character(Var2), corr = Freq) %>%
+  filter(var1 != var2) %>%
+  mutate(pair = paste(pmin(var1, var2), pmax(var1, var2), sep = "__")) %>%
+  distinct(pair, .keep_all = TRUE) %>%
+  mutate(abs_corr = abs(corr),
+         tgt1 = tgt_cor[var1, 1], 
+         tgt2 = tgt_cor[var2, 1],
+         drop_candidate = if_else(tgt1 <= tgt2, var1, var2)) %>%
+  filter(abs_corr > thr) %>%
+  arrange(desc(abs_corr))
+
+
+to_drop <- unique(pairs_df$drop_candidate)
+
+print(to_drop)
+print(pairs_df)
+
+```
+
+## Budowa przepisu
+
+```{r}
+
+rec <- recipe(grimm_pm10 ~ ., data = train) %>%
+  update_role(date, new_role = "id") %>%
+  step_mutate(
+    hour_s = sin(2*pi*as.numeric(hour)/24),
+    hour_c = cos(2*pi*as.numeric(hour)/24),
+    wday_s = sin(2*pi*as.numeric(wday)/7),
+    wday_c = cos(2*pi*as.numeric(wday)/7)
+  ) %>%
+  step_rm(hour, wday)
+
+rec <- rec %>% step_rm(all_of(to_drop))
+
+rec <- rec %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%  
+  step_normalize(all_numeric_predictors()) %>%   
+  step_zv(all_predictors())
+
+rec_prep <- prep(rec, training = train)
+train_tr <- bake(rec_prep, new_data = NULL)
+test_tr <- bake(rec_prep, new_data = test)
+
+```
+
+## EDA
+
+### Zmienna objaśniana
+
+```{r}
+ggplot(train_tr, aes(grimm_pm10)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.7) +
+  labs(title = "Rozkład zmiennej objaśnianej", x = "grimm_pm10") +
+  theme_minimal()
+```
+
+### Mapa korelacji
+
+```{r}
+cor_mat_tr <- train_tr %>%
+  select(where(is.numeric)) %>%
+  cor(use = "pairwise.complete.obs", method = "spearman")
+
+corrplot(cor_mat_tr, type = "lower", tl.cex = 0.6, mar = c(0,0,1,0),
+         addCoef.col = "black", number.cex = 0.6, number.digits = 2)
+```
+
+### Najważniejsze predyktory vs zmienna objaśniana
+
+```{r}
+num_pred <- train_tr %>% select(where(is.numeric), -grimm_pm10, -date) %>% names()
+tgt_cor_tr <- abs(cor(train_tr[, num_pred], train_tr$grimm_pm10, use = "pairwise.complete.obs"))
+top6 <- names(sort(tgt_cor_tr[,1], decreasing = TRUE)[1:6])
+
+train_tr %>%
+  select(grimm_pm10, all_of(top6)) %>%
+  pivot_longer(all_of(top6), names_to = "feature", values_to = "value") %>%
+  ggplot(aes(value, grimm_pm10)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(se = FALSE, color = "red") +
+  facet_wrap(~ feature, scales = "free_x") +
+  labs(title = "Target vs Top Correlated Features", x = NULL) +
+  theme_minimal()
+```
+
+W modelach regresji liniowych należy uwzględnić nieliniowość relacji.
+
+### Zmienna objaśniana
+
+```{r}
+train %>%
+  ggplot(aes(date, grimm_pm10)) +
+  geom_line(alpha = 0.7, color = "steelblue") +
+  labs(title = "Zmienna objaśniana") +
+  theme_minimal()
+```
+
+Widoczna jest luka w datach w kwietniu.
+
+## Detekcja interakcji
+
+### Metoda 1: Relacje warunkowe
+
+```{r}
+train_int <- train %>%
+  mutate(temp_bin = cut(temp, breaks = quantile(temp, probs = seq(0, 1, 0.25), na.rm = TRUE),
+                        include.lowest = TRUE, labels = c("Q1", "Q2", "Q3", "Q4")))
+
+ggplot(train_int, aes(ws, grimm_pm10, color = temp_bin)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(se = FALSE, method = "loess") +
+  labs(title = "Prędkość wiatru a PM10 według kwartyli temperatury",
+       subtitle = "Różne nachylenia sugerują interakcję temp:ws") +
+  theme_minimal()
+```
+
+Dla wyższych wartości temperatur relacja między prędkością wiatru a grimm_pm10 zmienia się.
+
+### Interakcje między pogodą
+
+```{r}
+train_weather <- train %>%
+  mutate(
+    high_rh = rh > median(rh, na.rm = TRUE),
+    high_temp = temp > median(temp, na.rm = TRUE),
+    weather_type = case_when(
+      high_rh & high_temp ~ "Ciepło i Wilgotno",
+      high_rh & !high_temp ~ "Zimno i Wilgotno",
+      !high_rh & high_temp ~ "Ciepło i Sucho",
+      TRUE ~ "Zimno i Sucho"
+    )
+  )
+
+ggplot(train_weather, aes(n_0500, grimm_pm10, color = weather_type)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(se = FALSE, method = "lm") +
+  labs(title = "Zliczenia cząsteczek vs PM10 z uwzględnieniem temperatury i wilgotności") +
+  theme_minimal() +
+  facet_wrap(~weather_type)
+```
+
+### Czasowe interakcje
+
+```{r}
+train_time <- train %>%
+  mutate(
+    hour_cat = case_when(
+      hour %in% 0:5 ~ "Noc",
+      hour %in% 6:11 ~ "Poranek",
+      hour %in% 12:17 ~ "Popołudnie",
+      TRUE ~ "Wieczór"
+    ),
+    weekend = wday %in% c("Sat", "Sun")
+  )
+
+ggplot(train_time, aes(n_0500, grimm_pm10, color = hour_cat)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(se = FALSE) +
+  labs(title = "Particle Count vs PM10 by Time of Day") +
+  theme_minimal()
+```
+
+## Podsumowanie
+
+W ostatecznym przepisie uwzględniono:
+
+-   Transformacje trygonometryczne czasu,
+
+-   Interakcje między zmiennymi pogodowymi i cząsteczkami,
+
+-   Normalizację i transformację Yeo–Johnsona,
+
+-   Kodowanie zmiennych kategorycznych.
+
+### Wyjściowy przepis
+
+```{r}
+rec <- recipe(grimm_pm10 ~ ., data = train) %>%
+  update_role(date, new_role = "id") %>%
+  step_mutate(
+    # Obsługa dni tygodnia i godzin
+    hour_s = sin(2*pi*as.numeric(hour)/24),
+    hour_c = cos(2*pi*as.numeric(hour)/24),
+    wday_s = sin(2*pi*as.numeric(wday)/7),
+    wday_c = cos(2*pi*as.numeric(wday)/7),
+    # Podział temperatury
+    temp_bin = cut(temp, 
+                   breaks = quantile(temp, probs = seq(0, 1, 0.25), na.rm = TRUE),
+                   include.lowest = TRUE, labels = c("Q1", "Q2", "Q3", "Q4")),
+    # Typ pogody
+    high_rh = rh > median(rh, na.rm = TRUE),
+    high_temp = temp > median(temp, na.rm = TRUE),
+    weather_type = case_when(
+      high_rh & high_temp ~ "warm_humid",
+      high_rh & !high_temp ~ "cool_humid",
+      !high_rh & high_temp ~ "warm_dry",
+      TRUE ~ "cool_dry"
+    ),
+    # Podział dnia
+    hour_cat = case_when(
+      as.numeric(hour) %in% 0:5 ~ "night",
+      as.numeric(hour) %in% 6:11 ~ "morning",
+      as.numeric(hour) %in% 12:17 ~ "afternoon",
+      TRUE ~ "evening"
+    ),
+    weekend = wday %in% c("Sat", "Sun")
+  ) %>%
+  step_string2factor(weather_type, hour_cat) %>%
+  step_rm(hour, wday, high_rh, high_temp) 
+
+
+  rec <- rec %>% step_rm(all_of(to_drop))
+
+
+# Interakcje
+rec <- rec %>%
+  step_dummy(all_nominal_predictors()) %>%  
+  step_interact(~ starts_with("weather_type"):matches("n_0500|n_0250|ws|temp")) %>%  
+  step_interact(~ starts_with("temp_bin"):matches("n_0500|n_0250|ws")) %>%  
+  step_interact(~ starts_with("hour_cat"):matches("n_0500|n_0250|ws")) %>%  
+  step_interact(~ weekend:matches("n_0500|n_0250|ws")) %>%  
+  step_YeoJohnson(all_numeric_predictors()) %>%  
+  step_normalize(all_numeric_predictors()) %>%   
+  step_zv(all_predictors())  
+
+rec_prep <- prep(rec, training = train)
+train_tr <- bake(rec_prep, new_data = NULL)
+test_tr <- bake(rec_prep, new_data = test)
+
+train_main <- train
+test_main <- test
+to_drop_main <- to_drop
+```
+
+# Model XGB
+
+```{r}
+train <- train_main
+test <- test_main
+to_drop <- to_drop_main
+
+fix_inputs <- function(df) {
+  df %>%
+    mutate(
+      date = as.POSIXct(date, tz = "UTC"),
+      hour = if ("hour" %in% names(.)) {
+        suppressWarnings(as.numeric(as.character(hour)))
+      } else {
+        as.numeric(lubridate::hour(date))
+      },
+      wday = if ("wday" %in% names(.)) {
+        suppressWarnings(as.numeric(as.character(wday)))
+      } else {
+        as.numeric(lubridate::wday(date, week_start = 1))
+      },
+      grimm_pm10 = as.numeric(grimm_pm10)
+    ) %>%
+    mutate(
+      hour = pmin(pmax(hour, 0), 23),
+      wday = pmin(pmax(wday, 1), 7)
+    )
+}
+```
+
+```{r}
+train <- fix_inputs(train)
+test  <- fix_inputs(test)
+
+split <- initial_time_split(train, prop = 0.8)
+
+head(train)
+head(test)
+```
+
+## Przepis bazowy
+
+```{r}
+rec_base_xgb <- recipe(grimm_pm10 ~ ., data = train) |> 
+    update_role(date, new_role = "id") |> 
+    step_mutate(
+      hour_s = sin(2*pi*as.numeric(hour)/24),
+      hour_c = cos(2*pi*as.numeric(hour)/24),
+      wday_s = sin(2*pi*as.numeric(wday)/7),
+      wday_c = cos(2*pi*as.numeric(wday)/7)) |> 
+    step_rm(hour, wday) # niepotrzebne
+  
+# usuwam bardzo skoreloawne zmienne z listy
+if (exists("to_drop", inherits = T) && length(intersect(to_drop, names(train))) > 0) {
+  rec_base_xgb <- rec_base_xgb |>  step_rm(all_of(intersect(to_drop, names(train))))}
+  
+# transformacja, normalizacja, stale kolumny
+rec_base_xgb <- rec_base_xgb |>
+  step_YeoJohnson(all_numeric_predictors()) |> 
+  step_normalize(all_numeric_predictors()) |> 
+  step_zv(all_predictors())
+```
+
+## Przepis kategorie + interakcje automatyczne
+
+```{r}
+cv <- names(train) |> keep(~ str_starts(.x, "n_"))
+wv <- names(train) |> keep(~ .x %in% c("ws","mws"))
+
+rec_time_weather_xgb <- recipe(grimm_pm10 ~ ., data = train) |> 
+  update_role(date, new_role = "id") |> 
+  step_mutate(
+      
+    # temp na kwartyle
+    temp_bin = if("temp" %in% names(train)) cut(
+      temp,
+      breaks = quantile(temp, probs = seq(0,1,0.25), na.rm = T),
+      include.lowest = T,
+      labels = c("q1","q2","q3","q4"))
+    else NA_character_,
+      
+    # jaka wilgotnosc i temp po medianie
+    high_rh = if("rh" %in% names(train)) rh > median(rh, na.rm = T) else NA,
+    high_temp = if ("temp" %in% names(train)) temp > median(temp, na.rm = T) else NA,
+      
+    # typy pogody
+    weather_type = case_when(
+      isTRUE(high_rh) & isTRUE(high_temp) ~ "warm_humid",
+      isTRUE(high_rh) & !isTRUE(high_temp) ~ "cold_humid",
+      !isTRUE(high_rh) & isTRUE(high_temp) ~ "warm_dry",
+      T ~ "cold_dry"),
+      
+    # pory dnia
+    time_of_day = case_when(
+      as.numeric(hour) %in% 0:5 ~ "night",
+      as.numeric(hour) %in% 6:11 ~ "morning",
+      as.numeric(hour) %in% 12:17 ~ "afternoon",
+      T ~ "evening"),
+    
+    weekend = as.numeric(wday) %in% c(6,7),
+    hour_s = sin(2*pi*as.numeric(hour)/24),
+    hour_c = cos(2*pi*as.numeric(hour)/24),
+    wday_s = sin(2*pi*as.numeric(wday)/7),
+    wday_c = cos(2*pi*as.numeric(wday)/7)) |> 
+    step_rm(high_rh, high_temp, hour, wday) |> 
+    step_string2factor(weather_type, time_of_day) |> 
+    step_zv(all_nominal_predictors()) |> 
+    step_dummy(all_nominal_predictors()) |> 
+    step_mutate(weekend = as.integer(weekend)) |> 
+    step_YeoJohnson(all_numeric_predictors()) |>
+    step_normalize(all_numeric_predictors()) |>
+    step_zv(all_predictors())
+# pozniej zeby progi liczyc na train: step_discretize(temp, num_breaks = 4, keep_original_cols = T)
+```
+
+## Przepis z PCA (model ma mniej zmiennych do analizy, zachowuje najwazniejsze "n\_"
+
+```{r}
+rec_pca_xgb <-  recipe(grimm_pm10 ~ ., data = train) |> 
+  update_role(date, new_role = "id") |> 
+  step_mutate(
+    hour_s = sin(2*pi*as.numeric(hour)/24),
+    hour_c = cos(2*pi*as.numeric(hour)/24),
+    wday_s = sin(2*pi*as.numeric(wday)/7),
+    wday_c = cos(2*pi*as.numeric(wday)/7)) |> 
+  step_rm(hour, wday) |> 
+  step_YeoJohnson(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_of(cv), num_comp = 10) |> # 10 na test, trzeba dostroic
+  step_zv(all_predictors())
+```
+
+## Test
+
+Testowe przygotowanie danych dla każdego przepisu XGB i podgląd ich struktury.
+
+```{r}
+rec_base_prep <- prep(rec_base_xgb)
+train_base <- juice(rec_base_prep)
+test_base  <- bake(rec_base_prep, new_data = test)
+cat("Wymiary train:", dim(train_base)[1], "x", dim(train_base)[2], "\n")
+glimpse(train_base)
+
+rec_tw_prep <- prep(rec_time_weather_xgb)
+train_tw <- juice(rec_tw_prep)
+test_tw  <- bake(rec_tw_prep, new_data = test)
+cat("Wymiary train:", dim(train_tw)[1], "x", dim(train_tw)[2], "\n")
+glimpse(train_tw)
+
+rec_pca_prep <- prep(rec_pca_xgb)
+train_pca <- juice(rec_pca_prep)
+test_pca  <- bake(rec_pca_prep, new_data = test)
+cat("Wymiary train:", dim(train_pca)[1], "x", dim(train_pca)[2], "\n")
+glimpse(train_pca)
+```
+
+## Definicja modelu
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  mtry = tune(),
+  loss_reduction = tune()) |> 
+  set_engine("xgboost") |> 
+  set_mode("regression")
+```
+
+## Walidacja krzyżowa
+
+```{r}
+cv_folds <- vfold_cv(train, v = 5)
+```
+
+## Workflow
+
+```{r}
+recipe_list <- list(
+  base = rec_base_xgb,
+  features = rec_time_weather_xgb,
+  pca = rec_pca_xgb)
+
+wf_set <- workflow_set(
+  preproc = recipe_list,
+  models = list(xgb = xgb_spec),
+  cross = T)
+
+print(wf_set)
+```
+
+## Tuning
+
+```{r}
+# ile predyktorów zostaje dla każdego recipe
+count_predictors_after_prep <- function(rec, training_data) {
+  rp <- tryCatch(prep(rec, training = training_data), error = function(e) e)
+  if (inherits(rp, "error")) {
+    warning("Prep failed for a recipe: ", conditionMessage(rp))
+    return(0)
+  }
+  max(0, ncol(juice(rp)) - 1)  # -1 bo kolumna celu
+}
+
+pred_counts <- map_int(recipe_list, ~ count_predictors_after_prep(.x, training = train))
+print(pred_counts)  
+
+min_preds <- min(pred_counts[pred_counts > 0], na.rm = TRUE)
+if (is.na(min_preds) || min_preds <= 0) {
+  stop("Nie udało się policzyć liczby predyktorów dla żadnego recipe.")
+}
+
+# bezpieczny zakres mtry
+mtry_upper <- min(5, as.integer(min_preds))
+mtry_lower <- 1
+
+xgb_grid <- grid_latin_hypercube(
+  trees(range = c(250, 1500)),
+  tree_depth(range = c(3, 10)),
+  min_n(range = c(10, 50)),
+  learn_rate(range = c(-2.5, -1)),  
+  mtry(range = c(mtry_lower, mtry_upper)),
+  loss_reduction(range = c(0,10)),
+  size = 50
+)
+
+tune_results <- wf_set |> 
+  workflow_map(
+    "tune_grid",
+    resamples = cv_folds,
+    grid = xgb_grid,
+    metrics = metric_set(rmse, mae),
+    control = control_grid(save_pred = TRUE, verbose = TRUE)
+  )
+```
+
+## Ewaluacja
+
+Ranking wyników strojenia i wybór najlepszej kombinacji.
+
+```{r}
+autoplot(tune_results)
+ranking <- rank_results(tune_results, rank_metric = "rmse", select_best = T)
+ranking
+
+best_combo <- tune_results |>  #combo = przepis i parametry
+  rank_results(rank_metric = "rmse") |> 
+  filter(.metric == "rmse") |> 
+  slice_head(n = 1)
+
+best_combo
+
+best_wf_id <- best_combo$wflow_id[1]
+
+best_wf <- tune_results |> 
+  extract_workflow(best_wf_id)
+
+best_params <- tune_results |> 
+  extract_workflow_set_result(best_wf_id) |> 
+  select_best(metric = "rmse")
+
+best_params
+```
+
+## Finalizacja
+
+Finalizacja workflowu XGB, dopasowanie do danych i ocena na zbiorze testowym.
+
+```{r}
+final_xgb_wf <- finalize_workflow(best_wf, best_params)
+
+print(final_xgb_wf)
+
+final_fit <- last_fit(final_xgb_wf, split = split)
+
+print(collect_metrics(final_fit))
+
+test_pred <- collect_predictions(final_fit)
+
+pred_plot <- ggplot(test_pred, aes(x = .pred, y = grimm_pm10)) +
+  geom_point(alpha = 0.5, color = "pink2") +
+  geom_abline(color = "purple", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Wartości obserwowane a predykcja na zbiorze testowym",
+    x = "Predykcje",
+    y = "Wartości obserwowane"
+  ) +
+  theme_minimal() +
+  coord_fixed()
+
+
+print(pred_plot)
+
+wf_fitted <- final_fit$.workflow[[1]]
+
+fit_parsnip <- tryCatch(
+  extract_fit_parsnip(wf_fitted),
+  error = function(e) {
+    message("extract_fit_parsnip nie zadziałał, stosuję pull_workflow_fit()")
+    pull_workflow_fit(wf_fitted)})
+
+xgb_fit_engine <- fit_parsnip$fit
+
+vip_plot <- vip(xgb_fit_engine, num_features = 20) +
+  ggtitle("Najważniejsze zmienne w modelu XGB")
+
+vip_plot
+```
+
+## Wyniki XGB
+
+```{r}
+if (!dir.exists("wyniki_xgb")) {
+  dir.create("wyniki_xgb", recursive = TRUE)}
+
+metryki_testowe <- collect_metrics(final_fit)
+write_csv(metryki_testowe, "wyniki_xgb/metryki_testowe.csv")
+write_csv(best_params, "wyniki_xgb/najlepsze_hiperparametry.csv")
+
+final_workflow_fitted <- extract_workflow(final_fit)
+saveRDS(final_workflow_fitted, "wyniki_xgb/final_xgb_workflow.rds")
+
+train <- train_main
+test <- test_main
+to_drop <- to_drop_main
+```
+
+# Model SVR
+
+## Lista zmiennych do usunięcia
+
+```{r}
+to_drop <- character(0)
+
+final_to_drop <- intersect(to_drop, names(train))
+if ("poj_h" %in% names(train) && !("poj_h" %in% final_to_drop)) {
+  final_to_drop <- c(final_to_drop, "poj_h")
+}
+```
+
+## RECEPTA 1: BAZOWA (bez interakcji)
+
+```{r}
+rec_svr_base <- recipe(grimm_pm10 ~ ., data = train) |>
+  update_role(date, new_role = "id") |>
+  step_mutate(
+    hour_s = sin(2*pi*as.numeric(hour)/24),
+    hour_c = cos(2*pi*as.numeric(hour)/24),
+    wday_s = sin(2*pi*as.numeric(wday)/7),
+    wday_c = cos(2*pi*as.numeric(wday)/7)
+  ) |>
+  step_rm(hour, wday) |>
+  step_rm(any_of(final_to_drop)) |>
+  step_YeoJohnson(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+```
+
+## RECEPTA 2: INTERAKCJE POGODOWE — FIX
+
+```{r}
+rec_svr_weather <- recipe(grimm_pm10 ~ ., data = train) |>
+  update_role(date, new_role = "id") |>
+  step_mutate(
+    hour_s = sin(2*pi*as.numeric(hour)/24),
+    hour_c = cos(2*pi*as.numeric(hour)/24),
+    wday_s = sin(2*pi*as.numeric(wday)/7),
+    wday_c = cos(2*pi*as.numeric(wday)/7),
+    high_rh   = if ("rh"   %in% names(train)) rh   > median(rh,   na.rm = TRUE) else NA,
+    high_temp = if ("temp" %in% names(train)) temp > median(temp, na.rm = TRUE) else NA,
+    weather_type = case_when(
+      isTRUE(high_rh) & isTRUE(high_temp) ~ "warm_humid",
+      isTRUE(high_rh) & !isTRUE(high_temp) ~ "cold_humid",
+      !isTRUE(high_rh) & isTRUE(high_temp) ~ "warm_dry",
+      TRUE ~ "cold_dry"
+    ),
+    # >>> WYMUSZAMY STAŁE POZIOMY <<<
+    weather_type = factor(weather_type,
+                          levels = c("warm_humid","cold_humid","warm_dry","cold_dry"))
+  ) |>
+  step_rm(hour, wday, high_rh, high_temp) |>
+  step_rm(any_of(final_to_drop)) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+  # >>> INTERAKCJE ZANIM COKOLWIEK USUNIEMY <<<
+  step_interact(terms = ~ starts_with("weather_type_"):matches("^n_\\d+$")) |>
+  step_interact(terms = ~ starts_with("weather_type_"):matches("^(ws|mws)$")) |>
+  step_YeoJohnson(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  # >>> DOPIERO TERAZ PRUNING <<<
+  step_zv(all_predictors())
+```
+
+## RECEPTA 3: INTERAKCJE CZASOWE
+
+```{r}
+rec_svr_temporal <- recipe(grimm_pm10 ~ ., data = train) |>
+  update_role(date, new_role = "id") |>
+  step_mutate(
+    hour_s = sin(2*pi*as.numeric(hour)/24),
+    hour_c = cos(2*pi*as.numeric(hour)/24),
+    wday_s = sin(2*pi*as.numeric(wday)/7),
+    wday_c = cos(2*pi*as.numeric(wday)/7),
+    # Pory dnia
+    time_of_day = case_when(
+      as.numeric(hour) %in% 0:5 ~ "night",
+      as.numeric(hour) %in% 6:11 ~ "morning",
+      as.numeric(hour) %in% 12:17 ~ "afternoon",
+      TRUE ~ "evening"
+    ),
+    # Weekend
+    weekend = as.integer(as.numeric(wday) %in% c(6, 7))
+  ) |>
+  step_rm(hour, wday) |>
+  step_rm(any_of(final_to_drop)) |>
+  step_string2factor(time_of_day) |>
+  step_novel(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+  step_zv(all_predictors()) |>  
+  # Interakcje pora dnia x zliczenia
+  step_interact(terms = ~ starts_with("time_of_day_"):matches("^n_\\d+$")) |>
+  # Interakcje weekend x zliczenia + wiatr
+  step_interact(terms = ~ weekend:matches("^n_\\d+$|^(ws|mws)$")) |>
+  step_YeoJohnson(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+```
+
+## RECEPTA 4: KOMBINOWANE (pogoda + czas + temperatura)
+
+```{r}
+rec_svr_combined <- recipe(grimm_pm10 ~ ., data = train) |>
+  update_role(date, new_role = "id") |>
+  step_mutate(
+    hour_s = sin(2*pi*as.numeric(hour)/24),
+    hour_c = cos(2*pi*as.numeric(hour)/24),
+    wday_s = sin(2*pi*as.numeric(wday)/7),
+    wday_c = cos(2*pi*as.numeric(wday)/7),
+    temp_bin = if ("temp" %in% names(train)) cut(
+      temp,
+      breaks = quantile(temp, probs = seq(0, 1, 0.25), na.rm = TRUE),
+      include.lowest = TRUE,
+      labels = c("q1","q2","q3","q4")
+    ) else NA_character_,
+    high_rh = if ("rh" %in% names(train)) rh > median(rh, na.rm = TRUE) else NA,
+    weather_humid = if_else(isTRUE(high_rh), "humid", "dry"),
+    weekend = as.integer(as.numeric(wday) %in% c(6, 7)),
+    # stałe poziomy
+    temp_bin = factor(temp_bin, levels = c("q1","q2","q3","q4")),
+    weather_humid = factor(weather_humid, levels = c("humid","dry"))
+  ) |>
+  step_rm(hour, wday, high_rh) |>
+  step_rm(any_of(final_to_drop)) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+  step_interact(terms = ~ starts_with("temp_bin_"):matches("^n_(0250|0500|1000)$")) |>
+  step_interact(terms = ~ starts_with("weather_humid_"):matches("^(ws|mws)$")) |>
+  step_interact(terms = ~ weekend:matches("^n_(0250|0500|1000)$")) |>
+  step_YeoJohnson(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+```
+
+## MODEL SVR I TUNING
+
+```{r}
+# Definicja modelu SVR 
+svr_spec <- svm_rbf(
+  cost = tune(),
+  rbf_sigma = tune()
+) |>
+  set_engine("kernlab") |>
+  set_mode("regression")
+
+# Workflow
+svr_workflows <- list(
+  svr_base = workflow() |> add_recipe(rec_svr_base) |> add_model(svr_spec),
+  svr_weather = workflow() |> add_recipe(rec_svr_weather) |> add_model(svr_spec),
+  svr_temporal = workflow() |> add_recipe(rec_svr_temporal) |> add_model(svr_spec),
+  svr_combined = workflow() |> add_recipe(rec_svr_combined) |> add_model(svr_spec)
+)
+```
+
+## Walidacja krzyżowa
+
+```{r}
+cv_folds <- vfold_cv(train, v = 5, strata = grimm_pm10)
+```
+
+## Siatka hiperparametrów
+
+Definicja siatki hiperparametrów i metryk dla SVR.
+
+```{r}
+svr_grid <- expand.grid(
+  cost = 10^seq(-1, 2, length.out = 4),       
+  rbf_sigma = 10^seq(-3, 0, length.out = 4)   
+) |> as_tibble()
+
+svr_metrics <- metric_set(rmse, rsq, mae)
+```
+
+## Tuning
+
+Uruchomienie procesu strojenia dla wszystkich wariantów SVR.
+
+```{r}
+tic()
+
+svr_tune_results <- imap(
+  svr_workflows,
+  ~ {
+    set.seed(42)
+    tune_grid(
+      .x,
+      resamples = cv_folds,
+      grid = svr_grid,
+      metrics = svr_metrics,
+      control = control_grid(verbose = FALSE, save_pred = TRUE)
+    )
+  }
+)
+
+toc()
+```
+
+## WYNIKI I WYBÓR NAJLEPSZEGO MODELU
+
+```{r}
+best_models_summary <- map_dfr(
+  svr_tune_results,
+  ~ {
+    best_rmse <- show_best(.x, metric = "rmse", n = 1)
+    best_rsq <- show_best(.x, metric = "rsq", n = 1)
+    best_mae <- show_best(.x, metric = "mae", n = 1)
+    
+    if (nrow(best_rmse) > 0) {
+      tibble(
+        mean_rmse = best_rmse$mean[1],
+        std_err_rmse = best_rmse$std_err[1],
+        mean_rsq = if(nrow(best_rsq) > 0) best_rsq$mean[1] else NA_real_,
+        mean_mae = if(nrow(best_mae) > 0) best_mae$mean[1] else NA_real_,
+        cost = best_rmse$cost[1],
+        rbf_sigma = best_rmse$rbf_sigma[1]
+      )
+    } else {
+      tibble(
+        mean_rmse = NA_real_, 
+        std_err_rmse = NA_real_,
+        mean_rsq = NA_real_,
+        mean_mae = NA_real_,
+        cost = NA_real_, 
+        rbf_sigma = NA_real_
+      )
+    }
+  },
+  .id = "recipe"
+) |>
+  mutate(recipe = str_remove(recipe, "svr_")) |>
+  filter(!is.na(mean_rmse)) |>
+  arrange(mean_rmse)
+
+print(best_models_summary, n = Inf)
+```
+
+## Wybór najlepszego modelu
+
+```{r}
+best_recipe_name <- best_models_summary$recipe[1]
+best_full_name <- paste0("svr_", best_recipe_name)
+best_results <- svr_tune_results[[best_full_name]]
+best_svr_params <- select_best(best_results, metric = "rmse")
+
+best_full_name
+print(best_svr_params)
+```
+
+## Finalizacja workflow
+
+```{r}
+best_svr_wf <- svr_workflows[[best_full_name]] |>
+  finalize_workflow(best_svr_params)
+
+tic()
+final_svr_fit <- fit(best_svr_wf, data = train)
+toc()
+```
+
+## Wyniki SVR
+
+Najlepsze wyniki modelu daje przepis "combined" z interakcjami temperatury, wilgotności i weekendu.
+
+Hiperparametry dla najlepszego modelu przyjmują wartości cost = 10 i rbf_sigma = 0.01.
+
+```{r}
+if (!dir.exists("wyniki")) {
+  dir.create("wyniki", recursive = TRUE)
+}
+
+saveRDS(svr_tune_results, "wyniki/svr_tune_results.rds")
+saveRDS(final_svr_fit, "wyniki/final_svr_model.rds")
+saveRDS(best_models_summary, "wyniki/best_models_summary.rds")
+```
+
+# Model LR
+
+```{r}
+train <- train_main
+test <- test_main
+to_drop <- to_drop_main
+
+target <- "grimm_pm10"
+
+n <- nrow(train_tr)
+initial <- floor(0.6 * n)       
+assess  <- floor(0.2 * n)       
+skip    <- floor(0.05 * n)      
+
+ts_cv <- rolling_origin(
+  data = train_tr,
+  initial = initial,
+  assess = assess,
+  cumulative = TRUE,
+  skip = skip
+)
+
+length(ts_cv$splits)
+```
+
+## Receipe
+
+```{r}
+rec <- recipe(grimm_pm10 ~ ., data = train_tr) %>%
+  step_zv(all_predictors()) %>%             # usuń predyktory bez zmienności
+  step_dummy(all_nominal_predictors()) %>%  # zamień zmienne kategoryczne na zmienne 0/1
+  step_normalize(all_numeric_predictors())  # standaryzacja zmiennych numerycznych
+```
+
+## Regresja liniowa i workflow
+
+```{r}
+lm_spec <- linear_reg() %>%
+  set_engine("lm")
+
+lm_wf <- workflow() %>%
+  add_model(lm_spec) %>%
+  add_recipe(rec)
+```
+
+## Walidacja z użyciem rolling-origin CV
+
+```{r}
+lm_resamples <- fit_resamples(
+  lm_wf,
+  resamples = ts_cv,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(lm_resamples)
+lm_preds <- collect_predictions(lm_resamples)
+```
+
+## Trenowanie finalnego modelu na całym zbiorze treningowym
+
+```{r}
+lm_final <- lm_wf %>%
+  fit(data = train_tr)
+
+tidy(lm_final %>% extract_fit_parsnip())
+```
+
+## Obliczenie współczynników i VIF
+
+```{r}
+lm_obj <- lm_final %>% pull_workflow_fit() %>% .$fit
+vif_safe <- function(model) { # obejście błędu przy car::vif()
+  mm <- model.matrix(model)
+  mm <- mm[, !is.na(coef(model))] 
+  car::vif(lm(model$y ~ mm - 1))
+}
+train_tr_lm <- train_tr
+test_tr_lm  <- test_tr
+```
+
+## Predykcje i reszty dla zbioru treningowego
+
+```{r}
+train_tr_lm$.fitted <- predict(lm_obj)
+train_tr_lm$.resid  <- residuals(lm_obj)
+
+train_tr_ml <- train_tr %>% select(-any_of(c(".fitted", ".resid")))
+test_tr_ml  <- test_tr  %>% select(-any_of(c(".fitted", ".resid")))
+```
+
+## Wykres
+
+```{r}
+ggplot(train_tr_lm, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals vs Fitted (train)")
+
+ggplot(train_tr_lm, aes(sample = .resid)) +
+  stat_qq() +
+  stat_qq_line() +
+  labs(title = "QQ plot reszt")
+
+shapiro_test <- shapiro.test(train_tr_lm$.resid[1:min(5000, nrow(train_tr_lm))])
+print(shapiro_test)
+```
+
+## Predykcje i metryki na zbiorze testowym
+
+```{r}
+test_pred_lm <- predict(lm_obj, newdata = test_tr_ml) %>% 
+  bind_cols(test_tr_ml %>% select(all_of(target)))
+
+test_pred_lm <- tibble(
+  .pred = predict(lm_obj, newdata = test_tr_ml),
+  !!target := test_tr_ml[[target]]
+)
+
+metrics_test_lm <- metric_set(rmse, rsq, mae)(
+  test_pred_lm, truth = !!sym(target), estimate = .pred
+)
+print("Metryki LM na zbiorze testowym:")
+print(metrics_test_lm)
+```
+
+## Wykres: przewidywane wartości
+
+```{r}
+ggplot(test_pred_lm, aes(x = .pred, y = !!sym(target))) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Observed vs Predicted (LM, test)", x = "Predicted", y = "Observed")
+```
+
+## Współczynniki regresji (posortowane wg wartości p)
+
+```{r}
+lm_coefs <- tidy(lm_obj) %>% arrange(p.value)
+print("Główne współczynniki (LM):")
+print(head(lm_coefs, 20))
+```
+
+## Zapis wyników
+
+```{r}
+if (!dir.exists("wyniki_lr")) {
+  dir.create("wyniki_lr", recursive = TRUE)
+}
+
+saveRDS(lm_resamples, "wyniki/lm_resamples.rds")          
+saveRDS(lm_final, "wyniki/lm_final_model.rds")            
+saveRDS(metrics_test_lm, "wyniki/lm_test_metrics.rds")    
+saveRDS(lm_coefs, "wyniki/lm_coefficients.rds")
+```
+
+# XGB, SVR, LR Models comparison
+
+## Wczytanie najlepszych modeli i generowanie predykcji
+
+```{r}
+metrics_set <- metric_set(rmse, rsq, mae)
+
+wszystkie_predykcje <- tibble()
+wszystkie_metryki <- tibble()
+
+# Model 1 - XGBoost
+xgb_model_path <- "wyniki_xgb/final_xgb_workflow.rds"
+if (file.exists(xgb_model_path)) {
+  message("Wczytuję model XGB...")
+  xgb_final_wf <- readRDS(xgb_model_path)
+  
+  # Generowanie predykcji na `test`
+  xgb_preds <- predict(xgb_final_wf, new_data = test) |>
+    bind_cols(test |> select(grimm_pm10, date)) |>
+    mutate(model = "XGBoost")
+  
+  # Obliczanie metryk
+  xgb_metrics <- metrics_set(xgb_preds, truth = grimm_pm10, estimate = .pred) |>
+    mutate(model = "XGBoost")
+  
+  wszystkie_predykcje <- bind_rows(wszystkie_predykcje, xgb_preds)
+  wszystkie_metryki <- bind_rows(wszystkie_metryki, xgb_metrics)
+  
+} else {
+  warning("Nie znaleziono zapisanego modelu XGB: ", xgb_model_path)
+}
+
+# Model 2 - SVR
+svr_model_path <- "wyniki/final_svr_model.rds"
+if (file.exists(svr_model_path)) {
+  message("Wczytuję model SVR...")
+  svr_final_fit <- readRDS(svr_model_path)
+  
+  # Generowanie predykcji na `test`
+  svr_preds <- predict(svr_final_fit, new_data = test) |>
+    bind_cols(test |> select(grimm_pm10, date)) |>
+    mutate(model = "SVR")
+  
+  # Obliczanie metryk
+  svr_metrics <- metrics_set(svr_preds, truth = grimm_pm10, estimate = .pred) |>
+    mutate(model = "SVR")
+  
+  wszystkie_predykcje <- bind_rows(wszystkie_predykcje, svr_preds)
+  wszystkie_metryki <- bind_rows(wszystkie_metryki, svr_metrics)
+  
+} else {
+  warning("Nie znaleziono zapisanego modelu SVR: ", svr_model_path)
+}
+
+# Model 3 - LR
+lr_model_path <- "wyniki/lm_final_model.rds"
+if (file.exists(lr_model_path)) {
+  message("Wczytuję model LR...")
+  lr_final_model <- readRDS(lr_model_path)
+  
+  test_tr
+  
+  # WAŻNE: Model LR był trenowany na `train_tr`, więc predykcje robimy na `test_tr`
+  lr_preds <- predict(lr_final_model, new_data = test_tr) |>
+    bind_cols(test_tr |> select(grimm_pm10, date)) |> # `date` jest w `test_tr` jako "id"
+    mutate(model = "Linear Regression")
+  
+  # Obliczanie metryk
+  lr_metrics <- metrics_set(lr_preds, truth = grimm_pm10, estimate = .pred) |>
+    mutate(model = "Linear Regression")
+  
+  wszystkie_predykcje <- bind_rows(wszystkie_predykcje, lr_preds)
+  wszystkie_metryki <- bind_rows(wszystkie_metryki, lr_metrics)
+  
+} else {
+  warning("Nie znaleziono zapisanego modelu LR: ", lr_model_path)
+}
+```
+
+## Porównanie wyników
+
+Tabelaryczne i graficzne porównanie metryk (RMSE, R-squared, MAE) dla wszystkich trzech modeli na zbiorze testowym.
+
+```{r}
+metryki_tabela <- wszystkie_metryki |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(rmse)
+
+print(knitr::kable(metryki_tabela, digits = 4))
+
+if (nrow(wszystkie_predykcje) > 0) {
+  
+  diag_line <- geom_abline(
+    color = "firebrick", 
+    linetype = "dashed", 
+    linewidth = 1
+  )
+  
+  min_val <- min(c(wszystkie_predykcje$.pred, wszystkie_predykcje$grimm_pm10), na.rm = TRUE)
+  max_val <- max(c(wszystkie_predykcje$.pred, wszystkie_predykcje$grimm_pm10), na.rm = TRUE)
+  lims <- c(min_val, max_val)
+  
+  plot_comparison <- ggplot(wszystkie_predykcje, aes(x = .pred, y = grimm_pm10)) +
+    geom_point(alpha = 0.3) +
+    diag_line +
+    facet_wrap(~ model) +
+    coord_fixed(ratio = 1, xlim = lims, ylim = lims) +
+    labs(
+      title = "Porównanie predykcji modeli na zbiorze testowym",
+      subtitle = "Wartości obserwowane vs. predykowane",
+      x = "Wartości predykowane",
+      y = "Wartości obserwowane (grimm_pm10)"
+    ) +
+    theme_minimal()
+  
+  print(plot_comparison)
+  
+  # Zapis wykresu
+  # ggsave("wyniki/porownanie_predykcji_test.png", plot_comparison, width = 10, height = 5, dpi = 300)
+  
+} else {
+  message("Brak danych predykcyjnych do wygenerowania wykresu.")
+}
+
+najlepszy_model <- metryki_tabela |>
+  slice_min(rmse, n = 1) |>
+  pull(model)
+```
+
+# Weryfikacja danych na zbiorze BAM
+
+```{r}
+load("dane/ops.RData") 
+load("dane/data_test.RData")
+
+final_model <- xgb_final_wf
+uzyty_model <- "XGBoost"
+```
+
+```{r}
+weryfikacja <- ops_data |> select(date:prec) 
+# wyciągasz z ops_data tylko daty i dane meteo
+
+weryfikacja <- weryfikacja |> 
+  left_join(bam, by = "date") |> 
+  mutate(grimm_pm10 = bam_pm10) |> 
+  select(-bam_pm10)
+# dodajesz dane BAM i podmieniasz nazwę kolumny bam_pm10 na grimm_pm10
+# (żeby struktura była taka sama jak w danych treningowych)
+
+ops <- ops |> select(-ops_pm10, -pres_sea)
+# usuwasz kolumny niepotrzebne przy predykcji
+
+nazwy <- colnames(ops) |> dput()
+weryfikacja <- weryfikacja |> 
+  select(all_of(nazwy))
+
+colnames(weryfikacja) == colnames(ops)
+weryfikacja <-weryfikacja |> na.omit()
+```
+
+## Uzupełnienie ewentualnych brakujących kolumn (np. hour, wday)
+
+```{r}
+if(!"hour" %in% names(weryfikacja)){
+  weryfikacja <- weryfikacja |> mutate(hour = lubridate::hour(date))
+}
+if(!"wday" %in% names(weryfikacja)){
+  weryfikacja <- weryfikacja |> mutate(wday = lubridate::wday(date))
+}
+```
+
+## Wypełnienie NA medianami (jak w treningu)
+
+```{r}
+weryfikacja <- weryfikacja |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+```
+
+## Predykcja
+
+```{r}
+weryfikacja_preds <- predict(final_model, new_data = weryfikacja) |> 
+  bind_cols(weryfikacja |> select(date, grimm_pm10))
+
+metrics_set <- yardstick::metric_set(rmse, rsq, mae)
+
+metryki_weryfikacja <- metrics_set(
+  data = weryfikacja_preds,
+  truth = grimm_pm10,
+  estimate = .pred
+)
+
+print(metryki_weryfikacja)
+```
+
+```{r}
+ggplot(weryfikacja_preds, aes(x = .pred, y = grimm_pm10)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(linetype = "dashed", color = "red") +
+  coord_fixed() +
+  labs(
+    title = "Porównanie predykcji XGB na zbiorze weryfikacyjnym",
+    x = "Predykcja modelu",
+    y = "Obserwacja (grimm_pm10)"
+  ) +
+  theme_minimal()
+```
+
+# Wnioski
+
+# Wnioski z analizy modeli
+
+Celem analizy było znalezienie najlepszego modelu regresyjnego do przewidywania stężenia **`grimm_pm10`**.\
+Porównano trzy algorytmy: **Regresję Liniową (LR)**, **Support Vector Regression (SVR)** oraz **XGBoost (XGB)**.
+
+------------------------------------------------------------------------
+
+## 1. Najlepsze przepisy (receptury)
+
+### XGBoost (XGB)
+
+-   Najlepsze wyniki osiągnął przy użyciu złożonego przepisu **`features_xgb`**,\
+    który obejmował zaawansowaną inżynierię cech, m.in.:
+    -   kategoryzację pogody i pory dnia,\
+    -   tworzenie interakcji między zmiennymi.
+
+### 🟦 Support Vector Regression (SVR)
+
+-   Najskuteczniejszy okazał się prostszy, bazowy przepis **`svr_base`**,\
+    który zawierał m.in.:
+    -   transformacje trygonometryczne czasu,\
+    -   normalizację danych.
+
+### 🟨 Regresja Liniowa (LR)
+
+-   Model ten korzystał z podstawowego przepisu, który obejmował m.in.:
+    -   usunięcie zmiennych skorelowanych,\
+    -   transformację **Yeo-Johnsona**.
+
+------------------------------------------------------------------------
+
+## 2. Wybór najlepszego modelu
+
+Porównanie metryk na zbiorze testowym:
+
+| Model             | RMSE  | R-squared (R²) | MAE   |
+|-------------------|-------|----------------|-------|
+| SVR               | 8.98  | 0.921          | 6.72  |
+| XGBoost           | 11.09 | 0.861          | 5.57  |
+| Linear Regression | 15.61 | 0.743          | 11.61 |
+
+**Wnioski:** 1. Regresja Liniowa była najsłabszym modelem.\
+2. SVR uzyskał najlepsze wyniki pod kątem RMSE i R-squared.\
+3. XGBoost osiągnął najlepszą (najniższą) metrykę MAE (Mean Absolute Error).
+
+**Ostatecznie wybrano model XGBoost** do dalszej weryfikacji — dlatego, że metryka **MAE** jest mniej wrażliwa na wartości odstające, co jest pożądane w danych o zanieczyszczeniach.
+
+------------------------------------------------------------------------
+
+## 3. Weryfikacja na zbiorze "BAM"
+
+**Cel:**\
+Sprawdzenie, jak wybrany model **XGBoost** poradzi sobie z zupełnie nowymi, zewnętrznymi danymi (ze stacji BAM), których nie widział podczas treningu.
+
+**Wyniki:**\
+Model na zbiorze weryfikacyjnym uzyskał jeszcze lepsze metryki niż na zbiorze testowym:
+
+| Metryka | Wartość |
+|---------|---------|
+| RMSE    | 6.65    |
+| R²      | 0.846   |
+| MAE     | 4.53    |
+
+**Wniosek:**\
+Znacznie lepsze wyniki (np. MAE 4.53 vs 5.57) dowodzą, że model **XGBoost** jest solidny, dokładny i bardzo dobrze generalizuje swoją wiedzę na nowe dane z innego źródła.\
+Potwierdza to również wykres predykcji, pokazujący silną korelację prognoz z obserwacjami.
